@@ -78,7 +78,9 @@ class GRUDecoder(nn.Module):
                 hidden_dim * 2, n_classes + 1
             )  # +1 for CTC blank
         else:
-            self.fc_decoder_out = nn.Linear(hidden_dim, n_classes + 1)  # +1 for CTC blank
+            self.fc_decoder_out = nn.Linear(
+                hidden_dim, n_classes + 1
+            )  # +1 for CTC blank
 
     def forward(self, neuralInput, dayIdx):
         neuralInput = torch.permute(neuralInput, (0, 2, 1))

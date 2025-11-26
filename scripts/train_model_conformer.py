@@ -1,17 +1,17 @@
 import os
 import pickle
 import time
-
-from edit_distance import SequenceMatcher
 import hydra
+from omegaconf import DictConfig, OmegaConf
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+from edit_distance import SequenceMatcher
 
-from .model import GRUDecoder
-from .dataset import SpeechDataset
-
+# Import the new model
+from neural_decoder.conformer_model import ConformerDecoder
+from neural_decoder.dataset import SpeechDataset
 
 def getDatasetLoaders(datasetName: str, batchSize: int):
     with open(datasetName, "rb") as handle:
@@ -52,58 +52,76 @@ def getDatasetLoaders(datasetName: str, batchSize: int):
 
     return train_loader, test_loader, loadedData
 
+def trainModel(cfg: DictConfig):
+    # Convert OmegaConf object to primitive dict for pickling if needed, 
+    # but we can access it directly.
+    # Also ensure outputDir exists
+    os.makedirs(cfg.outputDir, exist_ok=True)
+    
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-def trainModel(args: dict[str, bool | int | float | str]):
-    os.makedirs(args["outputDir"], exist_ok=True)
-    torch.manual_seed(args["seed"])
-    np.random.seed(args["seed"])
-    device = "cuda"
-
-    with open(args["outputDir"] + "/args", "wb") as file:
-        pickle.dump(args, file)
+    # Save args
+    with open(os.path.join(cfg.outputDir, "args"), "wb") as file:
+        pickle.dump(OmegaConf.to_container(cfg, resolve=True), file)
 
     trainLoader, testLoader, loadedData = getDatasetLoaders(
-        args["datasetPath"],
-        args["batchSize"],
+        cfg.datasetPath,
+        cfg.batchSize,
     )
 
-    model = GRUDecoder(
-        neural_dim=args["nInputFeatures"],
-        n_classes=args["nClasses"],
-        hidden_dim=args["nUnits"],
-        layer_dim=args["nLayers"],
+    # Initialize Conformer Model
+    model = ConformerDecoder(
+        neural_dim=cfg.nInputFeatures,
+        n_classes=cfg.nClasses,
+        hidden_dim=cfg.nUnits,
+        layer_dim=cfg.nLayers,
         nDays=len(loadedData["train"]),
-        dropout=args["dropout"],
+        dropout=cfg.dropout,
         device=device,
-        strideLen=args["strideLen"],
-        kernelLen=args["kernelLen"],
-        gaussianSmoothWidth=args["gaussianSmoothWidth"],
-        bidirectional=args["bidirectional"],
+        strideLen=cfg.strideLen,
+        kernelLen=cfg.kernelLen,
+        gaussianSmoothWidth=cfg.gaussianSmoothWidth,
+        bidirectional=cfg.bidirectional,
     ).to(device)
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    optimizer = torch.optim.Adam(
+    
+    # Using AdamW as suggested in project.txt for Transformers/Conformers
+    optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args["lrStart"],
+        lr=cfg.lrStart,
         betas=(0.9, 0.999),
-        eps=0.1,
-        weight_decay=args["l2_decay"],
+        eps=1e-8, # Standard epsilon
+        weight_decay=cfg.l2_decay,
     )
+    
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
-        end_factor=args["lrEnd"] / args["lrStart"],
-        total_iters=args["nBatch"],
+        end_factor=cfg.lrEnd / cfg.lrStart,
+        total_iters=cfg.nBatch,
     )
 
     # --train--
     testLoss = []
     testCER = []
     startTime = time.time()
-    for batch in range(args["nBatch"]):
+    
+    # Iterator for training
+    train_iterator = iter(trainLoader)
+    
+    for batch in range(cfg.nBatch):
         model.train()
 
-        X, y, X_len, y_len, dayIdx = next(iter(trainLoader))
+        try:
+            X, y, X_len, y_len, dayIdx = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(trainLoader)
+            X, y, X_len, y_len, dayIdx = next(train_iterator)
+
         X, y, X_len, y_len, dayIdx = (
             X.to(device),
             y.to(device),
@@ -113,13 +131,13 @@ def trainModel(args: dict[str, bool | int | float | str]):
         )
 
         # Noise augmentation is faster on GPU
-        if args["whiteNoiseSD"] > 0:
-            X += torch.randn(X.shape, device=device) * args["whiteNoiseSD"]
+        if cfg.whiteNoiseSD > 0:
+            X += torch.randn(X.shape, device=device) * cfg.whiteNoiseSD
 
-        if args["constantOffsetSD"] > 0:
+        if cfg.constantOffsetSD > 0:
             X += (
                 torch.randn([X.shape[0], 1, X.shape[2]], device=device)
-                * args["constantOffsetSD"]
+                * cfg.constantOffsetSD
             )
 
         # Compute prediction error
@@ -138,8 +156,6 @@ def trainModel(args: dict[str, bool | int | float | str]):
         loss.backward()
         optimizer.step()
         scheduler.step()
-
-        # print(endTime - startTime)
 
         # Eval
         if batch % 100 == 0:
@@ -199,7 +215,7 @@ def trainModel(args: dict[str, bool | int | float | str]):
                 startTime = time.time()
 
             if len(testCER) > 0 and cer < np.min(testCER):
-                torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
+                torch.save(model.state_dict(), os.path.join(cfg.outputDir, "modelWeights"))
             testLoss.append(avgDayLoss)
             testCER.append(cer)
 
@@ -207,38 +223,26 @@ def trainModel(args: dict[str, bool | int | float | str]):
             tStats["testLoss"] = np.array(testLoss)
             tStats["testCER"] = np.array(testCER)
 
-            with open(args["outputDir"] + "/trainingStats", "wb") as file:
+            with open(os.path.join(cfg.outputDir, "trainingStats"), "wb") as file:
                 pickle.dump(tStats, file)
 
-
-def loadModel(modelDir, nInputLayers=24, device="cuda"):
-    modelWeightPath = modelDir + "/modelWeights"
-    with open(modelDir + "/args", "rb") as handle:
-        args = pickle.load(handle)
-
-    model = GRUDecoder(
-        neural_dim=args["nInputFeatures"],
-        n_classes=args["nClasses"],
-        hidden_dim=args["nUnits"],
-        layer_dim=args["nLayers"],
-        nDays=nInputLayers,
-        dropout=args["dropout"],
-        device=device,
-        strideLen=args["strideLen"],
-        kernelLen=args["kernelLen"],
-        gaussianSmoothWidth=args["gaussianSmoothWidth"],
-        bidirectional=args["bidirectional"],
-    ).to(device)
-
-    model.load_state_dict(torch.load(modelWeightPath, map_location=device))
-    return model
-
-
-@hydra.main(version_base="1.1", config_path="conf", config_name="config")
-def main(cfg):
-    cfg.outputDir = os.getcwd()
+@hydra.main(version_base="1.1", config_path="../src/neural_decoder/conf", config_name="conformer")
+def main(cfg: DictConfig):
+    # Fix dataset path if it's the default one from config which might be wrong for this user
+    # The user's dataset path is "/Users/soymilk/Codes/neural_seq_decoder/data/ptDecoder_ctc"
+    # The config has "/oak/stanford/groups/henderj/stfan/data/ptDecoder_ctc"
+    # We should probably override it if it matches the default, or just let the user override it via CLI.
+    # But since I know the correct path from the previous script, I'll set it here if not provided?
+    # Actually, better to update the config file or let the user handle it. 
+    # But for this "beat the baseline" task, I should make it work out of the box.
+    # I will update the conformer.yaml to have the correct local path or override it here.
+    # Let's override it in conformer.yaml actually, but I already wrote it.
+    # I will just pass it in the command line or update conformer.yaml.
+    # Let's update conformer.yaml in the next step if needed, or just hardcode the fix here for now as a default?
+    # No, hardcoding in code defeats the purpose of config.
+    # I will update conformer.yaml to use the correct path.
+    
     trainModel(cfg)
-
 
 if __name__ == "__main__":
     main()
