@@ -14,6 +14,7 @@ class WhiteNoise(nn.Module):
         noise = torch.randn_like(x) * self.std
         return x + noise
 
+
 class MeanDriftNoise(nn.Module):
     def __init__(self, std=0.1):
         super().__init__()
@@ -23,6 +24,7 @@ class MeanDriftNoise(nn.Module):
         _, C = x.shape
         noise = torch.randn(1, C) * self.std
         return x + noise
+
 
 class GaussianSmoothing(nn.Module):
     """
@@ -49,7 +51,8 @@ class GaussianSmoothing(nn.Module):
         # gaussian function of each dimension.
         kernel = 1
         meshgrids = torch.meshgrid(
-            [torch.arange(size, dtype=torch.float32) for size in kernel_size]
+            [torch.arange(size, dtype=torch.float32) for size in kernel_size],
+            indexing="ij",
         )
         for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
             mean = (size - 1) / 2
