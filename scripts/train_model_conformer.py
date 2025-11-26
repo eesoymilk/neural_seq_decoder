@@ -62,6 +62,18 @@ def trainModel(cfg: DictConfig):
     # Also ensure outputDir exists
     os.makedirs(cfg.outputDir, exist_ok=True)
 
+    # Create a file-only logger for training progress to avoid disrupting tqdm
+    file_logger = logging.getLogger("file_only")
+    file_logger.setLevel(logging.INFO)
+    file_logger.propagate = False  # Don't propagate to root logger
+    file_handler = logging.FileHandler(
+        os.path.join(cfg.outputDir, "train_model_conformer.log"), mode="a"
+    )
+    file_handler.setFormatter(
+        logging.Formatter("[%(asctime)s][%(name)s][%(levelname)s] - %(message)s")
+    )
+    file_logger.addHandler(file_handler)
+
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -228,10 +240,10 @@ def trainModel(cfg: DictConfig):
                     }
                 )
 
-                # Log to file (using tqdm.write to avoid disrupting progress bar)
-                msg = f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {time_per_batch:>7.3f}"
-                tqdm.write(msg)
-                log.info(msg)
+                # Log to file only (using file_logger to avoid console output that disrupts tqdm)
+                file_logger.info(
+                    f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {time_per_batch:>7.3f}"
+                )
 
                 startTime = time.time()
 
