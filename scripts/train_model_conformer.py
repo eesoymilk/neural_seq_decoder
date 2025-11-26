@@ -1,6 +1,7 @@
 import os
 import pickle
 import time
+import logging
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import numpy as np
@@ -8,10 +9,12 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from edit_distance import SequenceMatcher
-
-# Import the new model
+from tqdm import tqdm
 from neural_decoder.conformer_model import ConformerDecoder
 from neural_decoder.dataset import SpeechDataset
+
+log = logging.getLogger(__name__)
+
 
 def getDatasetLoaders(datasetName: str, batchSize: int):
     with open(datasetName, "rb") as handle:
@@ -52,16 +55,18 @@ def getDatasetLoaders(datasetName: str, batchSize: int):
 
     return train_loader, test_loader, loadedData
 
+
 def trainModel(cfg: DictConfig):
-    # Convert OmegaConf object to primitive dict for pickling if needed, 
+    # Convert OmegaConf object to primitive dict for pickling if needed,
     # but we can access it directly.
     # Also ensure outputDir exists
     os.makedirs(cfg.outputDir, exist_ok=True)
-    
+
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    log.info(f"Using device: {device}")
 
     # Save args
     with open(os.path.join(cfg.outputDir, "args"), "wb") as file:
@@ -88,16 +93,16 @@ def trainModel(cfg: DictConfig):
     ).to(device)
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    
+
     # Using AdamW as suggested in project.txt for Transformers/Conformers
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lrStart,
         betas=(0.9, 0.999),
-        eps=1e-8, # Standard epsilon
+        eps=1e-8,  # Standard epsilon
         weight_decay=cfg.l2_decay,
     )
-    
+
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
@@ -109,11 +114,12 @@ def trainModel(cfg: DictConfig):
     testLoss = []
     testCER = []
     startTime = time.time()
-    
+
     # Iterator for training
     train_iterator = iter(trainLoader)
-    
-    for batch in range(cfg.nBatch):
+
+    pbar = tqdm(range(cfg.nBatch), desc="Training", unit="batch")
+    for batch in pbar:
         model.train()
 
         try:
@@ -164,7 +170,9 @@ def trainModel(cfg: DictConfig):
                 allLoss = []
                 total_edit_distance = 0
                 total_seq_length = 0
-                for X, y, X_len, y_len, testDayIdx in testLoader:
+                for X, y, X_len, y_len, testDayIdx in tqdm(
+                    testLoader, desc="Evaluating", leave=False
+                ):
                     X, y, X_len, y_len, testDayIdx = (
                         X.to(device),
                         y.to(device),
@@ -188,7 +196,7 @@ def trainModel(cfg: DictConfig):
                     )
                     for iterIdx in range(pred.shape[0]):
                         decodedSeq = torch.argmax(
-                            torch.tensor(pred[iterIdx, 0 : adjustedLens[iterIdx], :]),
+                            pred[iterIdx, 0 : adjustedLens[iterIdx], :],
                             dim=-1,
                         )  # [num_seq,]
                         decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
@@ -209,13 +217,28 @@ def trainModel(cfg: DictConfig):
                 cer = total_edit_distance / total_seq_length
 
                 endTime = time.time()
-                print(
-                    f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {(endTime - startTime) / 100:>7.3f}"
+                time_per_batch = (endTime - startTime) / 100
+
+                # Update progress bar with metrics
+                pbar.set_postfix(
+                    {
+                        "loss": f"{avgDayLoss:.4f}",
+                        "cer": f"{cer:.4f}",
+                        "time/batch": f"{time_per_batch:.3f}s",
+                    }
                 )
+
+                # Log to file (using tqdm.write to avoid disrupting progress bar)
+                msg = f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {time_per_batch:>7.3f}"
+                tqdm.write(msg)
+                log.info(msg)
+
                 startTime = time.time()
 
             if len(testCER) > 0 and cer < np.min(testCER):
-                torch.save(model.state_dict(), os.path.join(cfg.outputDir, "modelWeights"))
+                torch.save(
+                    model.state_dict(), os.path.join(cfg.outputDir, "modelWeights")
+                )
             testLoss.append(avgDayLoss)
             testCER.append(cer)
 
@@ -226,14 +249,19 @@ def trainModel(cfg: DictConfig):
             with open(os.path.join(cfg.outputDir, "trainingStats"), "wb") as file:
                 pickle.dump(tStats, file)
 
-@hydra.main(version_base="1.1", config_path="../src/neural_decoder/conf", config_name="conformer")
+
+@hydra.main(
+    version_base="1.1",
+    config_path="../src/neural_decoder/conf",
+    config_name="conformer",
+)
 def main(cfg: DictConfig):
     # Fix dataset path if it's the default one from config which might be wrong for this user
     # The user's dataset path is "/Users/soymilk/Codes/neural_seq_decoder/data/ptDecoder_ctc"
     # The config has "/oak/stanford/groups/henderj/stfan/data/ptDecoder_ctc"
     # We should probably override it if it matches the default, or just let the user override it via CLI.
     # But since I know the correct path from the previous script, I'll set it here if not provided?
-    # Actually, better to update the config file or let the user handle it. 
+    # Actually, better to update the config file or let the user handle it.
     # But for this "beat the baseline" task, I should make it work out of the box.
     # I will update the conformer.yaml to have the correct local path or override it here.
     # Let's override it in conformer.yaml actually, but I already wrote it.
@@ -241,8 +269,9 @@ def main(cfg: DictConfig):
     # Let's update conformer.yaml in the next step if needed, or just hardcode the fix here for now as a default?
     # No, hardcoding in code defeats the purpose of config.
     # I will update conformer.yaml to use the correct path.
-    
+
     trainModel(cfg)
+
 
 if __name__ == "__main__":
     main()
