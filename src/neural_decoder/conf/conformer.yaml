@@ -1,5 +1,6 @@
 defaults:
   - config
+  - _self_
 
 # Override defaults for Conformer
 nUnits: 256
