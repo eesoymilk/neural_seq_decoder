@@ -56,6 +56,87 @@ def getDatasetLoaders(datasetName: str, batchSize: int):
     return train_loader, test_loader, loadedData
 
 
+def move_batch_to_device(X, y, X_len, y_len, dayIdx, device):
+    """Move batch data to specified device."""
+    return (
+        X.to(device),
+        y.to(device),
+        X_len.to(device),
+        y_len.to(device),
+        dayIdx.to(device),
+    )
+
+
+def compute_adjusted_lengths(X_len, kernel_len, stride_len):
+    """Compute adjusted sequence lengths after convolution."""
+    return ((X_len - kernel_len) / stride_len).to(torch.int32)
+
+
+def compute_ctc_loss(model, loss_ctc, X, y, X_len, y_len, dayIdx):
+    """Compute CTC loss and return predictions, loss, and adjusted lengths."""
+    pred = model.forward(X, dayIdx)
+    adjusted_lens = compute_adjusted_lengths(X_len, model.kernelLen, model.strideLen)
+    loss = loss_ctc(
+        torch.permute(pred.log_softmax(2), [1, 0, 2]),
+        y,
+        adjusted_lens,
+        y_len,
+    )
+    return pred, loss, adjusted_lens
+
+
+def decode_and_compute_cer(pred, y, y_len, adjusted_lens):
+    """Decode predictions and compute character error rate metrics."""
+    total_edit_distance = 0
+    total_seq_length = 0
+
+    for iterIdx in range(pred.shape[0]):
+        decodedSeq = torch.argmax(
+            pred[iterIdx, 0 : adjusted_lens[iterIdx], :],
+            dim=-1,
+        )
+        decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
+        decodedSeq = decodedSeq.cpu().detach().numpy()
+        decodedSeq = np.array([i for i in decodedSeq if i != 0])
+
+        trueSeq = np.array(y[iterIdx][0 : y_len[iterIdx]].cpu().detach())
+
+        matcher = SequenceMatcher(a=trueSeq.tolist(), b=decodedSeq.tolist())
+        total_edit_distance += matcher.distance()
+        total_seq_length += len(trueSeq)
+
+    return total_edit_distance, total_seq_length
+
+
+def evaluate_model(model, testLoader, loss_ctc, device):
+    """Evaluate model on test set and return average loss and CER."""
+    model.eval()
+    allLoss = []
+    total_edit_distance = 0
+    total_seq_length = 0
+
+    for X, y, X_len, y_len, testDayIdx in tqdm(
+        testLoader, desc="Evaluating", leave=False
+    ):
+        X, y, X_len, y_len, testDayIdx = move_batch_to_device(
+            X, y, X_len, y_len, testDayIdx, device
+        )
+        pred, loss, adjusted_lens = compute_ctc_loss(
+            model, loss_ctc, X, y, X_len, y_len, testDayIdx
+        )
+
+        allLoss.append(loss.cpu().detach().numpy())
+        batch_edit_dist, batch_seq_len = decode_and_compute_cer(
+            pred, y, y_len, adjusted_lens
+        )
+        total_edit_distance += batch_edit_dist
+        total_seq_length += batch_seq_len
+
+    avg_loss = np.sum(allLoss) / len(testLoader)
+    cer = total_edit_distance / total_seq_length
+    return avg_loss, cer
+
+
 def trainModel(cfg: DictConfig):
     # Convert OmegaConf object to primitive dict for pickling if needed,
     # but we can access it directly.
@@ -89,20 +170,37 @@ def trainModel(cfg: DictConfig):
         cfg.batchSize,
     )
 
-    # Initialize Conformer Model
-    model = ConformerDecoder(
-        neural_dim=cfg.nInputFeatures,
-        n_classes=cfg.nClasses,
-        hidden_dim=cfg.nUnits,
-        layer_dim=cfg.nLayers,
-        nDays=len(loadedData["train"]),
-        dropout=cfg.dropout,
-        device=device,
-        strideLen=cfg.strideLen,
-        kernelLen=cfg.kernelLen,
-        gaussianSmoothWidth=cfg.gaussianSmoothWidth,
-        bidirectional=cfg.bidirectional,
-    ).to(device)
+    # Initialize Model based on config
+    if "squeezeformer" in cfg.modelName.lower():
+        print("Initializing SqueezeFormer Model")
+        model = SqueezeFormerDecoder(
+            neural_dim=cfg.nInputFeatures,
+            n_classes=cfg.nClasses,
+            hidden_dim=cfg.nUnits,
+            layer_dim=cfg.nLayers,
+            nDays=len(loadedData["train"]),
+            dropout=cfg.dropout,
+            device=device,
+            strideLen=cfg.strideLen,
+            kernelLen=cfg.kernelLen,
+            gaussianSmoothWidth=cfg.gaussianSmoothWidth,
+            bidirectional=cfg.bidirectional,
+        ).to(device)
+    else:
+        print("Initializing Conformer Model")
+        model = ConformerDecoder(
+            neural_dim=cfg.nInputFeatures,
+            n_classes=cfg.nClasses,
+            hidden_dim=cfg.nUnits,
+            layer_dim=cfg.nLayers,
+            nDays=len(loadedData["train"]),
+            dropout=cfg.dropout,
+            device=device,
+            strideLen=cfg.strideLen,
+            kernelLen=cfg.kernelLen,
+            gaussianSmoothWidth=cfg.gaussianSmoothWidth,
+            bidirectional=cfg.bidirectional,
+        ).to(device)
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
 
@@ -140,12 +238,8 @@ def trainModel(cfg: DictConfig):
             train_iterator = iter(trainLoader)
             X, y, X_len, y_len, dayIdx = next(train_iterator)
 
-        X, y, X_len, y_len, dayIdx = (
-            X.to(device),
-            y.to(device),
-            X_len.to(device),
-            y_len.to(device),
-            dayIdx.to(device),
+        X, y, X_len, y_len, dayIdx = move_batch_to_device(
+            X, y, X_len, y_len, dayIdx, device
         )
 
         # Noise augmentation is faster on GPU
@@ -159,13 +253,8 @@ def trainModel(cfg: DictConfig):
             )
 
         # Compute prediction error
-        pred = model.forward(X, dayIdx)
-
-        loss = loss_ctc(
-            torch.permute(pred.log_softmax(2), [1, 0, 2]),
-            y,
-            ((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
-            y_len,
+        pred, loss, adjusted_lens = compute_ctc_loss(
+            model, loss_ctc, X, y, X_len, y_len, dayIdx
         )
         loss = torch.sum(loss)
 
@@ -178,55 +267,7 @@ def trainModel(cfg: DictConfig):
         # Eval
         if batch % 100 == 0:
             with torch.no_grad():
-                model.eval()
-                allLoss = []
-                total_edit_distance = 0
-                total_seq_length = 0
-                for X, y, X_len, y_len, testDayIdx in tqdm(
-                    testLoader, desc="Evaluating", leave=False
-                ):
-                    X, y, X_len, y_len, testDayIdx = (
-                        X.to(device),
-                        y.to(device),
-                        X_len.to(device),
-                        y_len.to(device),
-                        testDayIdx.to(device),
-                    )
-
-                    pred = model.forward(X, testDayIdx)
-                    loss = loss_ctc(
-                        torch.permute(pred.log_softmax(2), [1, 0, 2]),
-                        y,
-                        ((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
-                        y_len,
-                    )
-                    loss = torch.sum(loss)
-                    allLoss.append(loss.cpu().detach().numpy())
-
-                    adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
-                        torch.int32
-                    )
-                    for iterIdx in range(pred.shape[0]):
-                        decodedSeq = torch.argmax(
-                            pred[iterIdx, 0 : adjustedLens[iterIdx], :],
-                            dim=-1,
-                        )  # [num_seq,]
-                        decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
-                        decodedSeq = decodedSeq.cpu().detach().numpy()
-                        decodedSeq = np.array([i for i in decodedSeq if i != 0])
-
-                        trueSeq = np.array(
-                            y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
-                        )
-
-                        matcher = SequenceMatcher(
-                            a=trueSeq.tolist(), b=decodedSeq.tolist()
-                        )
-                        total_edit_distance += matcher.distance()
-                        total_seq_length += len(trueSeq)
-
-                avgDayLoss = np.sum(allLoss) / len(testLoader)
-                cer = total_edit_distance / total_seq_length
+                avgDayLoss, cer = evaluate_model(model, testLoader, loss_ctc, device)
 
                 endTime = time.time()
                 time_per_batch = (endTime - startTime) / 100
@@ -268,20 +309,6 @@ def trainModel(cfg: DictConfig):
     config_name="conformer",
 )
 def main(cfg: DictConfig):
-    # Fix dataset path if it's the default one from config which might be wrong for this user
-    # The user's dataset path is "/Users/soymilk/Codes/neural_seq_decoder/data/ptDecoder_ctc"
-    # The config has "/oak/stanford/groups/henderj/stfan/data/ptDecoder_ctc"
-    # We should probably override it if it matches the default, or just let the user override it via CLI.
-    # But since I know the correct path from the previous script, I'll set it here if not provided?
-    # Actually, better to update the config file or let the user handle it.
-    # But for this "beat the baseline" task, I should make it work out of the box.
-    # I will update the conformer.yaml to have the correct local path or override it here.
-    # Let's override it in conformer.yaml actually, but I already wrote it.
-    # I will just pass it in the command line or update conformer.yaml.
-    # Let's update conformer.yaml in the next step if needed, or just hardcode the fix here for now as a default?
-    # No, hardcoding in code defeats the purpose of config.
-    # I will update conformer.yaml to use the correct path.
-
     trainModel(cfg)
 
 
