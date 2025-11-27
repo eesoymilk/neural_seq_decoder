@@ -1,6 +1,7 @@
 import os
 import pickle
 import time
+from typing import Union
 
 from edit_distance import SequenceMatcher
 import hydra
@@ -53,7 +54,7 @@ def getDatasetLoaders(datasetName: str, batchSize: int):
     return train_loader, test_loader, loadedData
 
 
-def trainModel(args: dict[str, bool | int | float | str]):
+def trainModel(args: dict[str, Union[bool, int, float, str]]):
     os.makedirs(args["outputDir"], exist_ok=True)
     torch.manual_seed(args["seed"])
     np.random.seed(args["seed"])
