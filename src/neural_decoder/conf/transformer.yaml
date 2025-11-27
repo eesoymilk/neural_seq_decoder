@@ -9,7 +9,7 @@ lrStart: 0.0005
 lrEnd: 0.0001
 modelName: "transformerV1"
 outputDir: "${hydra:runtime.cwd}/logs/speech_logs/${modelName}"
-datasetPath: "/Users/soymilk/Codes/neural_seq_decoder/data/ptDecoder_ctc"
+datasetPath: "/home/soymilk/neural_seq_decoder/data/ptDecoder_ctc"
 
 # Transformer specific
 nhead: 4
