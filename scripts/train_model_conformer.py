@@ -3,6 +3,7 @@ import pickle
 import time
 import logging
 import hydra
+from neural_decoder.squeezeformer_model import SqueezeFormerDecoder
 from omegaconf import DictConfig, OmegaConf
 import numpy as np
 import torch

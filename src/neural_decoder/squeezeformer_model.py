@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torchaudio
 from .augmentations import GaussianSmoothing
 
 class Swish(nn.Module):
